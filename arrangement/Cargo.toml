@@ -1,0 +1,18 @@
+[package]
+name = "arrangement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arrangement"
+path = "src/main.rs"
+
+[dependencies]
+lod2-common = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+nalgebra = { workspace = true }
+spade = { workspace = true }

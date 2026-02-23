@@ -1,0 +1,17 @@
+[package]
+name = "plane-extrude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "plane-extrude"
+path = "src/main.rs"
+
+[dependencies]
+lod2-common = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+nalgebra = { workspace = true }

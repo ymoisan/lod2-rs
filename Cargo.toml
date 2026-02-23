@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "lod2-common",
+    "plane-extrude",
+    "arrangement",
+    "graph-cut",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+spade = "2"
+kiddo = "4"
+gdal = { version = "0.17", features = ["bindgen"] }
+las = { version = "0.9", features = ["laz"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+petgraph = "0.6"
+rstar = "0.12"
+
+lod2-common = { path = "lod2-common" }

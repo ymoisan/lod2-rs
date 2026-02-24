@@ -1,0 +1,1 @@
+urban/periurban as per https://isprs-archives.copernicus.org/articles/XLVIII-1-W6-2025/83/2025/isprs-archives-XLVIII-1-W6-2025-83-2025.pdf

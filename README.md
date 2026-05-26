@@ -1,8 +1,10 @@
 # lod2-rs
 
-This repo hosts [LoD2](https://osmbuildings.org/blog/2018-02-28_level_of_detail/) 3D buildings reconstruction methods from aerial lidar with a deliberate intent to use Rust.  Pretty much all code here will be written by AI, following careful planning and continuous "human steering" (whence the choice of the [unlicense](https://unlicense.org/)).
+This repo hosts [LoD2](https://osmbuildings.org/blog/2018-02-28_level_of_detail/) 3D buildings reconstruction methods from aerial lidar with a deliberate intent to use Rust.  Pretty much all code here is written by AI, following careful planning and continuous "human steering".
 
 For background see [A new benchmark on LoD 2 building reconstruction from aerial lidar and footprints](https://isprs-archives.copernicus.org/articles/XLVIII-1-W6-2025/83/2025/isprs-archives-XLVIII-1-W6-2025-83-2025.pdf).
+
+Released under the [MIT License](LICENSE). Copyright (c) His Majesty the King in Right of Canada, as represented by the Minister of Natural Resources, 2026.
 
 ---
 

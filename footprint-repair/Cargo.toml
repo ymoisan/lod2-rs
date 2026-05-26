@@ -1,18 +1,19 @@
 [package]
-name = "arrangement"
+name = "footprint-repair"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "arrangement"
+name = "footprint-repair"
 path = "src/main.rs"
 
 [dependencies]
-lod2-common = { workspace = true, features = ["io"] }
+nalgebra = { workspace = true }
+gdal = { workspace = true }
+las = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-nalgebra = { workspace = true }
-spade = { workspace = true }
+rstar = { workspace = true }

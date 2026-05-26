@@ -1,53 +1,62 @@
 use clap::Parser;
+use lod2_common::hints::BuildingHint;
 use lod2_common::mesh::{BuildingGeometry, Face, Mesh, SemanticSurface};
 use lod2_common::pipeline::{self, PipelineArgs, Reconstructor, build_flat_roof};
-use lod2_common::plane::{Plane, PlaneDetector, RansacConfig};
+use lod2_common::plane::{Plane, PlaneDetector, PlaneDetectorConfig};
 use lod2_common::point_cloud::PointCloud;
 use lod2_common::polygon::Footprint;
 use nalgebra::Point3;
 
-/// TerraScan-style: detect planes via RANSAC, extrude each independently.
-struct PlaneExtrudeReconstructor {
-    detector: PlaneDetector,
-}
+struct PlaneExtrudeReconstructor;
 
 impl PlaneExtrudeReconstructor {
     fn new() -> Self {
-        Self {
-            detector: PlaneDetector::new(RansacConfig {
-                epsilon: 0.25,
-                max_iterations: 2000,
-                min_points: 10,
-                max_planes: 25,
-                wall_angle_threshold: 70.0,
-                merge_angle_degrees: 10.0,
-                merge_distance: 0.4,
-            }),
+        Self
+    }
+
+    fn make_config(hint: &BuildingHint) -> PlaneDetectorConfig {
+        let max_planes = hint
+            .roof_shape
+            .as_ref()
+            .map(|s| s.suggested_max_planes())
+            .unwrap_or(12);
+        PlaneDetectorConfig {
+            epsilon: 0.2,
+            min_points: 10,
+            max_planes,
+            wall_angle_threshold: 15.0,
+            merge_angle_degrees: 10.0,
+            merge_distance: 0.4,
+            merge_centroid_2d_distance: 5.0,
+            ..PlaneDetectorConfig::default()
         }
     }
 
-    /// Build LoD 2.2 mesh by detecting planes and extruding each roof plane
-    /// with walls down to ground level.
     fn build_lod22(
         &self,
         footprint: &Footprint,
         points: &PointCloud,
         h_ground: f64,
+        hint: &BuildingHint,
     ) -> Option<Mesh> {
-        let planes = self.detector.detect_multiple(&points.positions, 20);
+        let config = Self::make_config(hint);
+        let detector = PlaneDetector::new(config);
+        let planes = detector.detect_multiple(&points.positions, 50);
         if planes.is_empty() {
-            let stats = points.compute_statistics();
-            return build_flat_roof(footprint, h_ground, stats.z_70p);
+            return None;
         }
+
+        let z_max = hint
+            .estimated_height()
+            .map(|h| h_ground + h);
 
         let mut mesh = Mesh::new();
         let ground_idx = mesh.add_semantic(SemanticSurface::ground());
 
         for plane in &planes {
-            self.add_plane_to_mesh(&mut mesh, plane, footprint, &points.positions, h_ground);
+            self.add_plane_to_mesh(&mut mesh, plane, footprint, &points.positions, h_ground, z_max);
         }
 
-        // Ground face from footprint
         let exterior = &footprint.polygon.exterior;
         let n = exterior.len().saturating_sub(1);
         if n >= 3 {
@@ -62,14 +71,12 @@ impl PlaneExtrudeReconstructor {
         }
 
         if mesh.faces.len() < 2 {
-            let stats = points.compute_statistics();
-            return build_flat_roof(footprint, h_ground, stats.z_70p);
+            return None;
         }
 
         Some(mesh)
     }
 
-    /// Add a single detected plane as roof + walls to the mesh.
     fn add_plane_to_mesh(
         &self,
         mesh: &mut Mesh,
@@ -77,6 +84,7 @@ impl PlaneExtrudeReconstructor {
         footprint: &Footprint,
         points: &[Point3<f64>],
         h_ground: f64,
+        z_max: Option<f64>,
     ) {
         let roof_idx = mesh.add_semantic(SemanticSurface::roof_with_stats(
             plane.slope_degrees(),
@@ -84,7 +92,6 @@ impl PlaneExtrudeReconstructor {
         ));
         let wall_idx = mesh.add_semantic(SemanticSurface::wall(true));
 
-        // Get 2D convex hull of inlier points projected onto footprint
         let mut pts_2d: Vec<(f64, f64)> = plane
             .inliers
             .iter()
@@ -107,7 +114,6 @@ impl PlaneExtrudeReconstructor {
             return;
         }
 
-        // Clip hull to footprint exterior (simplified: keep points inside)
         let clipped: Vec<(f64, f64)> = hull
             .iter()
             .filter(|(x, y)| footprint.contains_2d(*x, *y))
@@ -119,15 +125,17 @@ impl PlaneExtrudeReconstructor {
             return;
         }
 
-        // Create roof face with Z from plane equation
         let mut roof_verts = Vec::new();
         for &(x, y) in roof_pts {
-            let z = plane.eval_z(x, y).unwrap_or(h_ground + 5.0);
+            let mut z = plane.eval_z(x, y).unwrap_or(h_ground + 5.0);
+            z = z.max(h_ground);
+            if let Some(ceil) = z_max {
+                z = z.min(ceil);
+            }
             roof_verts.push(mesh.add_vertex(Point3::new(x, y, z)));
         }
         mesh.add_face(Face::new(roof_verts.clone()).with_semantic(roof_idx));
 
-        // Create wall faces extruding down to ground
         let n = roof_verts.len();
         for i in 0..n {
             let j = (i + 1) % n;
@@ -155,29 +163,44 @@ impl Reconstructor for PlaneExtrudeReconstructor {
         points: &PointCloud,
         h_ground: f64,
     ) -> BuildingGeometry {
+        use lod2_common::mesh::RoofReason;
+
         let mut geom = BuildingGeometry::new(&footprint.id);
         geom.attributes = footprint.attributes.clone();
         geom.h_ground = h_ground;
+        let hint = BuildingHint::from_footprint(footprint);
 
-        if points.len() < 5 {
+        if hint.is_flat() {
             let stats = points.compute_statistics();
-            let h_roof = if stats.count > 0 { stats.z_70p } else { h_ground + 5.0 };
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
             geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FlatByAttribute);
             return geom;
         }
 
-        geom.lod22 = self.build_lod22(footprint, points, h_ground);
+        if points.len() < 5 {
+            let stats = points.compute_statistics();
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
+            geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FallbackNoPlanes);
+            return geom;
+        }
+
+        geom.lod22 = self.build_lod22(footprint, points, h_ground, &hint);
 
         if geom.lod22.is_none() {
             let stats = points.compute_statistics();
-            geom.lod22 = build_flat_roof(footprint, h_ground, stats.z_70p);
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
+            geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FallbackNoPlanes);
+        } else {
+            geom.roof_reason = Some(RoofReason::Reconstructed);
         }
 
         geom
     }
 }
 
-/// Simple 2D convex hull (Andrew's monotone chain).
 fn convex_hull_2d(pts: &mut Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
     pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-10 && (a.1 - b.1).abs() < 1e-10);

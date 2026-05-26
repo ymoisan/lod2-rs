@@ -1,33 +1,38 @@
 use clap::Parser;
+use lod2_common::hints::{BuildingHint, RoofShape};
 use lod2_common::mesh::{BuildingGeometry, Face, Mesh, SemanticSurface};
 use lod2_common::pipeline::{self, PipelineArgs, Reconstructor, build_flat_roof};
-use lod2_common::plane::{intersect_planes, clip_line_to_bbox, Plane, PlaneDetector, RansacConfig};
+use lod2_common::plane::{intersect_planes, clip_line_to_bbox, split_segments_at_intersections, Plane, PlaneDetector, PlaneDetectorConfig};
 use lod2_common::point_cloud::PointCloud;
 use lod2_common::polygon::Footprint;
 use nalgebra::Point3;
-// petgraph reserved for future full alpha-expansion implementation
 use spade::{ConstrainedDelaunayTriangulation, Point2 as SpadePoint2, Triangulation};
 use std::collections::HashMap;
 
-/// Roofer-style: CDT arrangement + graph-cut labeling optimization.
 struct GraphCutReconstructor {
-    detector: PlaneDetector,
     lambda: f64,
 }
 
 impl GraphCutReconstructor {
     fn new() -> Self {
-        Self {
-            detector: PlaneDetector::new(RansacConfig {
-                epsilon: 0.25,
-                max_iterations: 2000,
-                min_points: 10,
-                max_planes: 25,
-                wall_angle_threshold: 70.0,
-                merge_angle_degrees: 10.0,
-                merge_distance: 0.4,
-            }),
-            lambda: 0.5,
+        Self { lambda: 0.5 }
+    }
+
+    fn make_config(hint: &BuildingHint) -> PlaneDetectorConfig {
+        let max_planes = hint
+            .roof_shape
+            .as_ref()
+            .map(|s| s.suggested_max_planes())
+            .unwrap_or(12);
+        PlaneDetectorConfig {
+            epsilon: 0.2,
+            min_points: 10,
+            max_planes,
+            wall_angle_threshold: 15.0,
+            merge_angle_degrees: 10.0,
+            merge_distance: 0.4,
+            merge_centroid_2d_distance: 5.0,
+            ..PlaneDetectorConfig::default()
         }
     }
 
@@ -36,16 +41,17 @@ impl GraphCutReconstructor {
         footprint: &Footprint,
         points: &PointCloud,
         h_ground: f64,
+        hint: &BuildingHint,
     ) -> Option<Mesh> {
-        let planes = self.detector.detect_multiple(&points.positions, 20);
+        let config = Self::make_config(hint);
+        let detector = PlaneDetector::new(config);
+        let planes = detector.detect_multiple(&points.positions, 50);
         if planes.is_empty() {
-            let stats = points.compute_statistics();
-            return build_flat_roof(footprint, h_ground, stats.z_70p);
+            return None;
         }
 
         let bbox = footprint.polygon.bbox_2d();
 
-        // Compute ridgelines from plane intersections
         let mut ridge_segments: Vec<([f64; 2], [f64; 2])> = Vec::new();
         for i in 0..planes.len() {
             for j in (i + 1)..planes.len() {
@@ -56,6 +62,21 @@ impl GraphCutReconstructor {
                 }
             }
         }
+
+        if let Some(bearing) = hint.roof_direction {
+            let allowed = allowed_bearings(hint);
+            ridge_segments.retain(|&(p1, p2)| {
+                let seg_bearing = segment_bearing(&p1, &p2);
+                allowed.iter().any(|&b| bearing_within(seg_bearing, b, 25.0))
+            });
+            let _ = bearing;
+        }
+
+        // Pre-split ridgelines at mutual intersections and footprint boundary crossings
+        let fp_edges = footprint_boundary_edges(footprint);
+        let ridge_with_meta: Vec<_> = ridge_segments.iter().map(|&(p1, p2)| (p1, p2, ())).collect();
+        let split = split_segments_at_intersections(&fp_edges, &ridge_with_meta, 1e-3);
+        let ridge_segments: Vec<_> = split.into_iter().map(|(p1, p2, _)| (p1, p2)).collect();
 
         self.build_graphcut_mesh(footprint, &planes, &ridge_segments, &points.positions, h_ground)
     }
@@ -77,7 +98,6 @@ impl GraphCutReconstructor {
         let mut cdt: ConstrainedDelaunayTriangulation<SpadePoint2<f64>> =
             ConstrainedDelaunayTriangulation::new();
 
-        // Insert footprint boundary
         let mut boundary_handles = Vec::new();
         for i in 0..n {
             let v = &exterior.vertices[i];
@@ -91,7 +111,6 @@ impl GraphCutReconstructor {
             let _ = cdt.add_constraint(boundary_handles[i], boundary_handles[j]);
         }
 
-        // Insert ridgeline segments
         for (p1, p2) in ridge_segments {
             let h1 = cdt.insert(SpadePoint2::new(p1[0], p1[1]));
             let h2 = cdt.insert(SpadePoint2::new(p2[0], p2[1]));
@@ -102,7 +121,6 @@ impl GraphCutReconstructor {
             }
         }
 
-        // Collect faces inside footprint
         let mut face_data: Vec<FaceInfo> = Vec::new();
         let mut face_index_map: HashMap<usize, usize> = HashMap::new();
 
@@ -137,17 +155,11 @@ impl GraphCutReconstructor {
             return None;
         }
 
-        // Compute data cost: for each face, cost of assigning each plane label
         let num_labels = planes.len();
         let data_costs = self.compute_data_costs(&face_data, planes, points, footprint);
-
-        // Build adjacency graph (faces that share an edge)
         let adjacency = self.build_adjacency(&cdt, &face_index_map, footprint);
-
-        // Graph-cut optimization via iterative label swapping (alpha-expansion approximation)
         let labels = self.optimize_labels(&face_data, &data_costs, &adjacency, num_labels);
 
-        // Build mesh from labeled faces
         self.build_mesh_from_labels(
             footprint, &face_data, &labels, planes, h_ground, n, exterior,
         )
@@ -185,7 +197,7 @@ impl GraphCutReconstructor {
                         if count > 0 {
                             sum_dist / count as f64
                         } else {
-                            10.0 // penalty for no support
+                            10.0
                         }
                     })
                     .collect()
@@ -199,8 +211,6 @@ impl GraphCutReconstructor {
         _face_index_map: &HashMap<usize, usize>,
         _footprint: &Footprint,
     ) -> Vec<(usize, usize, f64)> {
-        // Adjacency extraction from spade's CDT is complex; using greedy labeling
-        // which doesn't require adjacency. Full alpha-expansion would use this.
         Vec::new()
     }
 
@@ -211,8 +221,6 @@ impl GraphCutReconstructor {
         _adjacency: &[(usize, usize, f64)],
         _num_labels: usize,
     ) -> Vec<usize> {
-        // Simplified: assign each face its lowest-cost label (greedy)
-        // Full alpha-expansion would iterate, but greedy works well for most buildings
         faces
             .iter()
             .enumerate()
@@ -268,7 +276,6 @@ impl GraphCutReconstructor {
             mesh.add_face(Face::new(verts).with_semantic(sem));
         }
 
-        // Ground
         let mut bottom = Vec::with_capacity(n);
         for i in 0..n {
             let v = &exterior.vertices[i];
@@ -278,7 +285,6 @@ impl GraphCutReconstructor {
             Face::new(bottom.iter().rev().copied().collect()).with_semantic(ground_idx),
         );
 
-        // Walls
         for i in 0..n {
             let j = (i + 1) % n;
             let vi = &exterior.vertices[i];
@@ -305,7 +311,6 @@ impl GraphCutReconstructor {
         faces: &[FaceInfo],
         labels: &[usize],
     ) -> Option<f64> {
-        // Find nearest face and use its label
         let mut best_dist = f64::MAX;
         let mut best_label = 0;
         for (fi, face) in faces.iter().enumerate() {
@@ -343,26 +348,92 @@ impl Reconstructor for GraphCutReconstructor {
         points: &PointCloud,
         h_ground: f64,
     ) -> BuildingGeometry {
+        use lod2_common::mesh::RoofReason;
+
         let mut geom = BuildingGeometry::new(&footprint.id);
         geom.attributes = footprint.attributes.clone();
         geom.h_ground = h_ground;
+        let hint = BuildingHint::from_footprint(footprint);
 
-        if points.len() < 5 {
+        if hint.is_flat() {
             let stats = points.compute_statistics();
-            let h_roof = if stats.count > 0 { stats.z_70p } else { h_ground + 5.0 };
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
             geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FlatByAttribute);
             return geom;
         }
 
-        geom.lod22 = self.build_lod22(footprint, points, h_ground);
+        if points.len() < 5 {
+            let stats = points.compute_statistics();
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
+            geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FallbackNoPlanes);
+            return geom;
+        }
+
+        geom.lod22 = self.build_lod22(footprint, points, h_ground, &hint);
 
         if geom.lod22.is_none() {
             let stats = points.compute_statistics();
-            geom.lod22 = build_flat_roof(footprint, h_ground, stats.z_70p);
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
+            geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FallbackNoPlanes);
+        } else {
+            geom.roof_reason = Some(RoofReason::Reconstructed);
         }
 
         geom
     }
+}
+
+fn segment_bearing(p1: &[f64; 2], p2: &[f64; 2]) -> f64 {
+    let dx = p2[0] - p1[0];
+    let dy = p2[1] - p1[1];
+    let mut b = dy.atan2(dx).to_degrees();
+    if b < 0.0 {
+        b += 360.0;
+    }
+    b
+}
+
+fn bearing_within(a: f64, b: f64, tolerance: f64) -> bool {
+    let mut diff = (a - b).abs() % 360.0;
+    if diff > 180.0 {
+        diff = 360.0 - diff;
+    }
+    diff <= tolerance || (180.0 - diff).abs() <= tolerance
+}
+
+fn allowed_bearings(hint: &BuildingHint) -> Vec<f64> {
+    let bearing = match hint.roof_direction {
+        Some(b) => b,
+        None => return vec![],
+    };
+    match hint.roof_shape {
+        Some(RoofShape::Gabled) | Some(RoofShape::Skillion) => vec![bearing],
+        Some(RoofShape::Hipped) | Some(RoofShape::Pyramidal) => vec![bearing, (bearing + 90.0) % 360.0],
+        _ => vec![bearing, (bearing + 90.0) % 360.0],
+    }
+}
+
+fn footprint_boundary_edges(footprint: &Footprint) -> Vec<([f64; 2], [f64; 2])> {
+    let ext = &footprint.polygon.exterior;
+    let n = ext.len().saturating_sub(1);
+    let mut edges = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = &ext.vertices[i];
+        let b = &ext.vertices[(i + 1) % n];
+        edges.push(([a.x, a.y], [b.x, b.y]));
+    }
+    for hole in &footprint.polygon.interiors {
+        let hn = hole.len().saturating_sub(1);
+        for i in 0..hn {
+            let a = &hole.vertices[i];
+            let b = &hole.vertices[(i + 1) % hn];
+            edges.push(([a.x, a.y], [b.x, b.y]));
+        }
+    }
+    edges
 }
 
 fn main() -> anyhow::Result<()> {

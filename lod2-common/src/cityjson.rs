@@ -1,6 +1,8 @@
 use crate::mesh::{BuildingGeometry, Mesh, SurfaceType};
 use crate::polygon::AttributeValue;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -89,7 +91,6 @@ impl CityJsonWriter {
 
     fn build_feature(&self, geom: &BuildingGeometry) -> Result<Value, CityJsonError> {
         let id = &geom.id;
-        let mut vertices: Vec<[i64; 3]> = Vec::new();
         let mut city_objects: Map<String, Value> = Map::new();
 
         let mesh = match geom.best_lod() {
@@ -113,17 +114,38 @@ impl CityJsonWriter {
             };
             attributes.insert(key.clone(), json_value);
         }
-
-        for v in &mesh.vertices {
-            let x = ((v.x - self.transform.translate[0]) / self.transform.scale[0]) as i64;
-            let y = ((v.y - self.transform.translate[1]) / self.transform.scale[1]) as i64;
-            let z = ((v.z - self.transform.translate[2]) / self.transform.scale[2]) as i64;
-            vertices.push([x, y, z]);
+        if let Some(ref reason) = geom.roof_reason {
+            attributes.insert("roof_reason".to_string(), Value::String(reason.as_str().to_string()));
         }
+
+        // Shared vertex dedup map across all LoD meshes
+        let mut vertex_map: HashMap<[i64; 3], u32> = HashMap::new();
+
+        let quantize = |v: &nalgebra::Point3<f64>| -> [i64; 3] {
+            [
+                ((v.x - self.transform.translate[0]) / self.transform.scale[0]) as i64,
+                ((v.y - self.transform.translate[1]) / self.transform.scale[1]) as i64,
+                ((v.z - self.transform.translate[2]) / self.transform.scale[2]) as i64,
+            ]
+        };
+
+        let dedup_mesh = |mesh: &Mesh, vertex_map: &mut HashMap<[i64; 3], u32>| -> Vec<u32> {
+            let mut remap = Vec::with_capacity(mesh.vertices.len());
+            for v in &mesh.vertices {
+                let key = quantize(v);
+                let next_idx = vertex_map.len() as u32;
+                let idx = *vertex_map.entry(key).or_insert(next_idx);
+                remap.push(idx);
+            }
+            remap
+        };
+
+        // Dedup main mesh vertices
+        let remap = dedup_mesh(mesh, &mut vertex_map);
 
         let lod = if geom.lod22.is_some() { "2.2" } else { "1.2" };
 
-        let boundaries = self.build_solid_boundaries(mesh);
+        let boundaries = self.build_solid_boundaries(mesh, &remap);
         let (sem_surfaces, sem_values) = self.build_semantics(mesh);
 
         let geom_json = json!({
@@ -133,6 +155,7 @@ impl CityJsonWriter {
             "semantics": { "surfaces": sem_surfaces, "values": [sem_values] }
         });
 
+        // BuildingPart with the main LoD geometry
         let building_part_id = format!("{}-0", id);
         city_objects.insert(building_part_id.clone(), json!({
             "type": "BuildingPart",
@@ -140,16 +163,33 @@ impl CityJsonWriter {
             "geometry": [geom_json]
         }));
 
-        let footprint_bounds = self.build_footprint_boundaries(mesh);
+        // LoD0 geometry on the Building object (derived footprint)
+        let mut building_geoms: Vec<Value> = Vec::new();
+        if let Some(ref lod0_mesh) = geom.lod0 {
+            let lod0_remap = dedup_mesh(lod0_mesh, &mut vertex_map);
+            let lod0_boundaries = self.build_multisurface_boundaries(lod0_mesh, &lod0_remap);
+            if !lod0_boundaries.is_empty() {
+                building_geoms.push(json!({
+                    "type": "MultiSurface",
+                    "lod": "0",
+                    "boundaries": lod0_boundaries
+                }));
+            }
+        }
+
+        // Finalize vertex array
+        let mut vertices: Vec<[i64; 3]> = vec![[0; 3]; vertex_map.len()];
+        for (key, &idx) in &vertex_map {
+            vertices[idx as usize] = *key;
+        }
+
         let mut building = json!({
             "type": "Building",
             "attributes": attributes,
             "children": [building_part_id]
         });
-        if !footprint_bounds.is_empty() {
-            building["geometry"] = json!([{
-                "type": "MultiSurface", "lod": "0", "boundaries": footprint_bounds
-            }]);
+        if !building_geoms.is_empty() {
+            building["geometry"] = json!(building_geoms);
         }
         city_objects.insert(id.clone(), building);
 
@@ -161,22 +201,56 @@ impl CityJsonWriter {
         }))
     }
 
-    fn build_solid_boundaries(&self, mesh: &Mesh) -> Vec<Vec<Vec<u32>>> {
+    fn build_solid_boundaries(&self, mesh: &Mesh, remap: &[u32]) -> Vec<Vec<Vec<u32>>> {
+        // Face winding is preserved from the mesh as-is.  The mesh construction
+        // already guarantees outward-pointing normals (ground = CW viewed from
+        // above → normal down, walls/roof = CCW → normal outward).  Normalising
+        // every ring to CCW would flip the ground face and break the manifold
+        // (shared edges between ground and walls would run in the same direction).
         let mut boundaries = Vec::new();
         for face in &mesh.faces {
             if face.indices.len() < 3 {
                 continue;
             }
-            let mut ring: Vec<u32> = face.indices.clone();
-            if !is_ccw_2d(mesh, &face.indices) {
-                ring.reverse();
+            let ring: Vec<u32> = face.indices.iter().map(|&i| remap[i as usize]).collect();
+            // Skip degenerate faces where vertex deduplication collapsed distinct
+            // mesh vertices to the same CityJSON index (e.g., zero-height walls).
+            let unique: HashSet<u32> = ring.iter().copied().collect();
+            if unique.len() < 3 {
+                continue;
             }
-            boundaries.push(vec![ring]);
+            let mut rings = vec![ring];
+            for hole in &face.holes {
+                let hole_ring: Vec<u32> = hole.iter().map(|&i| remap[i as usize]).collect();
+                rings.push(hole_ring);
+            }
+            boundaries.push(rings);
         }
         boundaries
     }
 
-    fn build_footprint_boundaries(&self, mesh: &Mesh) -> Vec<Vec<Vec<u32>>> {
+    fn build_multisurface_boundaries(&self, mesh: &Mesh, remap: &[u32]) -> Vec<Vec<Vec<u32>>> {
+        let mut boundaries = Vec::new();
+        for face in &mesh.faces {
+            if face.indices.len() < 3 {
+                continue;
+            }
+            let ring: Vec<u32> = face.indices.iter().map(|&i| remap[i as usize]).collect();
+            let unique: HashSet<u32> = ring.iter().copied().collect();
+            if unique.len() < 3 {
+                continue;
+            }
+            let mut rings = vec![ring];
+            for hole in &face.holes {
+                let hole_ring: Vec<u32> = hole.iter().map(|&i| remap[i as usize]).collect();
+                rings.push(hole_ring);
+            }
+            boundaries.push(rings);
+        }
+        boundaries
+    }
+
+    fn build_footprint_boundaries(&self, mesh: &Mesh, remap: &[u32]) -> Vec<Vec<Vec<u32>>> {
         let mut boundaries = Vec::new();
         for face in &mesh.faces {
             let is_ground = face.semantic_index
@@ -184,11 +258,19 @@ impl CityJsonWriter {
                 .map(|s| s.surface_type == SurfaceType::GroundSurface)
                 .unwrap_or(false);
             if is_ground && face.indices.len() >= 3 {
-                let mut ring: Vec<u32> = face.indices.clone();
+                let mut ring: Vec<u32> = face.indices.iter().map(|&i| remap[i as usize]).collect();
                 if !is_ccw_2d(mesh, &face.indices) {
                     ring.reverse();
                 }
-                boundaries.push(vec![ring]);
+                let mut rings = vec![ring];
+                for hole in &face.holes {
+                    let mut hole_ring: Vec<u32> = hole.iter().map(|&i| remap[i as usize]).collect();
+                    if is_ccw_2d(mesh, hole) {
+                        hole_ring.reverse();
+                    }
+                    rings.push(hole_ring);
+                }
+                boundaries.push(rings);
             }
         }
         boundaries

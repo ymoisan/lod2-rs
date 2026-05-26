@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Local-only Cargo target redirect (user-specific build dir)
+/.cargo/
+
+# Pixi local env
+**/.pixi/
+
+# Built binaries (rebuild via Docker)
+/buildex
+
+# Local data (LiDAR, ground truth, model output) — kept out of git
+/gt/
+/halifax-out/
+/eval/data/
+/eval/out/
+
+# Certificates (machine-specific)
+/certs/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/

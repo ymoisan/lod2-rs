@@ -1,0 +1,25 @@
+[package]
+name = "hybrid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hybrid"
+path = "src/main.rs"
+
+[dependencies]
+lod2-common = { workspace = true, default-features = false, features = ["pipeline"] }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+nalgebra = { workspace = true }
+rand = { workspace = true }
+las = { workspace = true }
+mimalloc = { workspace = true }
+laz = "0.12"
+byteorder = "1"
+thiserror = { workspace = true }
+rusqlite = { version = "0.35", features = ["bundled"] }
+rayon = { workspace = true }

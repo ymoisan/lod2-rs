@@ -2,9 +2,7 @@
 resolver = "2"
 members = [
     "lod2-common",
-    "plane-extrude",
-    "arrangement",
-    "graph-cut",
+    "hybrid",
 ]
 
 [workspace.package]
@@ -16,7 +14,6 @@ license = "MIT OR Apache-2.0"
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 spade = "2"
 kiddo = "4"
-gdal = { version = "0.17", features = ["bindgen"] }
 las = { version = "0.9", features = ["laz"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -30,5 +27,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 petgraph = "0.6"
 rstar = "0.12"
+mimalloc = "0.1"
+earcutr = "0.4"
 
-lod2-common = { path = "lod2-common" }
+lod2-common = { path = "lod2-common", default-features = false }

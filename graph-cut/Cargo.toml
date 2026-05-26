@@ -9,7 +9,7 @@ name = "graph-cut"
 path = "src/main.rs"
 
 [dependencies]
-lod2-common = { workspace = true }
+lod2-common = { workspace = true, features = ["io"] }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

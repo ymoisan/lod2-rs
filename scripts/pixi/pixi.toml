@@ -1,0 +1,35 @@
+[workspace]
+name = "lod2-rs-scripts"
+version = "0.1.0"
+description = "Diagnostic helpers (GPKG / SpatiaLite inspection) for lod2-rs"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+sqlite = ">=3.45"
+libspatialite = ">=5.1"
+
+[tasks.schema]
+cmd = """sqlite3 -batch /mnt/d/halifax-county/AutoBuilding.gpkg \
+  "SELECT table_name, column_name, geometry_type_name, srs_id FROM gpkg_geometry_columns; .schema \\"SELECT\\""
+"""
+
+[tasks.inspect-fid]
+args = [{ "arg" = "fid", "default" = "21522" }]
+cmd = """sqlite3 -batch -cmd ".load mod_spatialite" \
+  /mnt/d/halifax-county/AutoBuilding.gpkg \
+  "SELECT fid, GeometryType(GeomFromGPB(geometry)), ST_NumGeometries(GeomFromGPB(geometry)), ST_Area(GeomFromGPB(geometry)) FROM \\"SELECT\\" WHERE fid={{ fid }};"
+"""
+
+[tasks.inspect-fid-wkt]
+args = [{ "arg" = "fid", "default" = "21522" }]
+cmd = """sqlite3 -batch -cmd ".load mod_spatialite" \
+  /mnt/d/halifax-county/AutoBuilding.gpkg \
+  "SELECT substr(ST_AsText(GeomFromGPB(geometry)), 1, 600) FROM \\"SELECT\\" WHERE fid={{ fid }};"
+"""
+
+[tasks.count-multipolygons]
+cmd = """sqlite3 -batch -cmd ".load mod_spatialite" \
+  /mnt/d/halifax-county/AutoBuilding.gpkg \
+  "SELECT GeometryType(GeomFromGPB(geometry)) AS gt, COUNT(*) FROM \\"SELECT\\" GROUP BY gt;"
+"""

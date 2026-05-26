@@ -1,29 +1,35 @@
 use clap::Parser;
+use lod2_common::hints::{BuildingHint, RoofShape};
 use lod2_common::mesh::{BuildingGeometry, Face, Mesh, SemanticSurface};
 use lod2_common::pipeline::{self, PipelineArgs, Reconstructor, build_flat_roof};
-use lod2_common::plane::{intersect_planes, clip_line_to_bbox, Plane, PlaneDetector, RansacConfig};
+use lod2_common::plane::{intersect_planes, clip_line_to_bbox, split_segments_at_intersections, Plane, PlaneDetector, PlaneDetectorConfig};
 use lod2_common::point_cloud::PointCloud;
 use lod2_common::polygon::Footprint;
 use nalgebra::Point3;
 use spade::{ConstrainedDelaunayTriangulation, Point2 as SpadePoint2, Triangulation};
 
-/// City3D-style: plane arrangement + face selection optimization.
-struct ArrangementReconstructor {
-    detector: PlaneDetector,
-}
+struct ArrangementReconstructor;
 
 impl ArrangementReconstructor {
     fn new() -> Self {
-        Self {
-            detector: PlaneDetector::new(RansacConfig {
-                epsilon: 0.25,
-                max_iterations: 2000,
-                min_points: 10,
-                max_planes: 25,
-                wall_angle_threshold: 70.0,
-                merge_angle_degrees: 10.0,
-                merge_distance: 0.4,
-            }),
+        Self
+    }
+
+    fn make_config(hint: &BuildingHint) -> PlaneDetectorConfig {
+        let max_planes = hint
+            .roof_shape
+            .as_ref()
+            .map(|s| s.suggested_max_planes())
+            .unwrap_or(12);
+        PlaneDetectorConfig {
+            epsilon: 0.2,
+            min_points: 10,
+            max_planes,
+            wall_angle_threshold: 15.0,
+            merge_angle_degrees: 10.0,
+            merge_distance: 0.4,
+            merge_centroid_2d_distance: 5.0,
+            ..PlaneDetectorConfig::default()
         }
     }
 
@@ -32,16 +38,17 @@ impl ArrangementReconstructor {
         footprint: &Footprint,
         points: &PointCloud,
         h_ground: f64,
+        hint: &BuildingHint,
     ) -> Option<Mesh> {
-        let planes = self.detector.detect_multiple(&points.positions, 20);
+        let config = Self::make_config(hint);
+        let detector = PlaneDetector::new(config);
+        let planes = detector.detect_multiple(&points.positions, 50);
         if planes.is_empty() {
-            let stats = points.compute_statistics();
-            return build_flat_roof(footprint, h_ground, stats.z_70p);
+            return None;
         }
 
         let bbox = footprint.polygon.bbox_2d();
 
-        // Compute ridgelines (pairwise plane intersections clipped to bbox)
         let mut segments: Vec<([f64; 2], [f64; 2], usize, usize)> = Vec::new();
         for i in 0..planes.len() {
             for j in (i + 1)..planes.len() {
@@ -53,7 +60,21 @@ impl ArrangementReconstructor {
             }
         }
 
-        // Build CDT with footprint boundary + ridgeline segments
+        if let Some(bearing) = hint.roof_direction {
+            let allowed = allowed_bearings(hint);
+            segments.retain(|&(p1, p2, _, _)| {
+                let seg_bearing = segment_bearing(&p1, &p2);
+                allowed.iter().any(|&b| bearing_within(seg_bearing, b, 25.0))
+            });
+            let _ = bearing; // suppress unused warning
+        }
+
+        // Pre-split ridgelines at mutual intersections and footprint boundary crossings
+        let fp_edges = footprint_boundary_edges(footprint);
+        let ridge_with_meta: Vec<_> = segments.iter().map(|&(p1, p2, i, j)| (p1, p2, (i, j))).collect();
+        let split = split_segments_at_intersections(&fp_edges, &ridge_with_meta, 1e-3);
+        let segments: Vec<_> = split.into_iter().map(|(p1, p2, (i, j))| (p1, p2, i, j)).collect();
+
         self.build_arrangement_mesh(footprint, &planes, &segments, &points.positions, h_ground)
     }
 
@@ -74,7 +95,6 @@ impl ArrangementReconstructor {
         let mut cdt: ConstrainedDelaunayTriangulation<SpadePoint2<f64>> =
             ConstrainedDelaunayTriangulation::new();
 
-        // Insert footprint boundary vertices
         let mut boundary_handles = Vec::new();
         for i in 0..n {
             let v = &exterior.vertices[i];
@@ -84,13 +104,11 @@ impl ArrangementReconstructor {
             }
         }
 
-        // Add footprint boundary as constraints
         for i in 0..boundary_handles.len() {
             let j = (i + 1) % boundary_handles.len();
             let _ = cdt.add_constraint(boundary_handles[i], boundary_handles[j]);
         }
 
-        // Insert ridgeline segments as constraints
         for (p1, p2, _, _) in segments {
             let h1 = cdt.insert(SpadePoint2::new(p1[0], p1[1]));
             let h2 = cdt.insert(SpadePoint2::new(p2[0], p2[1]));
@@ -105,7 +123,6 @@ impl ArrangementReconstructor {
         let ground_idx = mesh.add_semantic(SemanticSurface::ground());
         let wall_idx = mesh.add_semantic(SemanticSurface::wall(true));
 
-        // Per-plane roof semantic indices
         let roof_semantics: Vec<usize> = planes
             .iter()
             .map(|p| {
@@ -116,7 +133,6 @@ impl ArrangementReconstructor {
             })
             .collect();
 
-        // Classify each triangle face: assign to best-fitting plane
         for face_handle in cdt.inner_faces() {
             let [v0, v1, v2] = face_handle.vertices();
             let p0 = v0.position();
@@ -130,7 +146,6 @@ impl ArrangementReconstructor {
                 continue;
             }
 
-            // Score each plane: how many inlier points are near this triangle?
             let best_plane = self.find_best_plane(planes, points, cx, cy, footprint);
 
             let (z0, z1, z2, sem_idx) = if let Some(pi) = best_plane {
@@ -142,7 +157,7 @@ impl ArrangementReconstructor {
                     roof_semantics[pi],
                 )
             } else {
-                let stats = PointCloud { positions: points.to_vec() }.compute_statistics();
+                let stats = PointCloud { positions: points.to_vec(), classifications: vec![6; points.len()], ndvi: None }.compute_statistics();
                 let h = stats.z_70p;
                 (h, h, h, roof_semantics[0])
             };
@@ -153,7 +168,6 @@ impl ArrangementReconstructor {
             mesh.add_face(Face::new(vec![i0, i1, i2]).with_semantic(sem_idx));
         }
 
-        // Add ground and walls
         let mut bottom = Vec::with_capacity(n);
         for i in 0..n {
             let v = &exterior.vertices[i];
@@ -163,13 +177,11 @@ impl ArrangementReconstructor {
             Face::new(bottom.iter().rev().copied().collect()).with_semantic(ground_idx),
         );
 
-        // Outer walls: for each footprint edge, create a wall quad
         for i in 0..n {
             let j = (i + 1) % n;
             let vi = &exterior.vertices[i];
             let vj = &exterior.vertices[j];
 
-            // Find roof height at these boundary points (from nearest plane)
             let zi = self
                 .eval_height_at(planes, vi.x, vi.y, points, footprint)
                 .unwrap_or(h_ground + 3.0);
@@ -221,7 +233,6 @@ impl ArrangementReconstructor {
         }
 
         if best_score < 2 {
-            // Fall back to closest plane by distance
             let mut min_dist = f64::MAX;
             for (pi, plane) in planes.iter().enumerate() {
                 if let Some(z) = plane.eval_z(cx, cy) {
@@ -261,26 +272,96 @@ impl Reconstructor for ArrangementReconstructor {
         points: &PointCloud,
         h_ground: f64,
     ) -> BuildingGeometry {
+        use lod2_common::mesh::RoofReason;
+
         let mut geom = BuildingGeometry::new(&footprint.id);
         geom.attributes = footprint.attributes.clone();
         geom.h_ground = h_ground;
+        let hint = BuildingHint::from_footprint(footprint);
 
-        if points.len() < 5 {
+        if hint.is_flat() {
             let stats = points.compute_statistics();
-            let h_roof = if stats.count > 0 { stats.z_70p } else { h_ground + 5.0 };
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
             geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FlatByAttribute);
             return geom;
         }
 
-        geom.lod22 = self.build_lod22(footprint, points, h_ground);
+        if points.len() < 5 {
+            let stats = points.compute_statistics();
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
+            geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FallbackNoPlanes);
+            return geom;
+        }
+
+        geom.lod22 = self.build_lod22(footprint, points, h_ground, &hint);
 
         if geom.lod22.is_none() {
             let stats = points.compute_statistics();
-            geom.lod22 = build_flat_roof(footprint, h_ground, stats.z_70p);
+            let h_roof = hint.best_roof_height(stats.z_70p, h_ground);
+            geom.lod22 = build_flat_roof(footprint, h_ground, h_roof);
+            geom.roof_reason = Some(RoofReason::FallbackNoPlanes);
+        } else {
+            geom.roof_reason = Some(RoofReason::Reconstructed);
         }
 
         geom
     }
+}
+
+/// Compute the bearing (0..360 degrees, north=0, clockwise) of a 2D segment.
+fn segment_bearing(p1: &[f64; 2], p2: &[f64; 2]) -> f64 {
+    let dx = p2[0] - p1[0];
+    let dy = p2[1] - p1[1];
+    let mut b = dy.atan2(dx).to_degrees();
+    if b < 0.0 {
+        b += 360.0;
+    }
+    b
+}
+
+/// Check if two bearings are within `tolerance` degrees of each other,
+/// accounting for the 180-degree ambiguity of undirected lines.
+fn bearing_within(a: f64, b: f64, tolerance: f64) -> bool {
+    let mut diff = (a - b).abs() % 360.0;
+    if diff > 180.0 {
+        diff = 360.0 - diff;
+    }
+    diff <= tolerance || (180.0 - diff).abs() <= tolerance
+}
+
+/// Return the set of bearings to allow based on roof shape and direction hint.
+fn allowed_bearings(hint: &BuildingHint) -> Vec<f64> {
+    let bearing = match hint.roof_direction {
+        Some(b) => b,
+        None => return vec![],
+    };
+    match hint.roof_shape {
+        Some(RoofShape::Gabled) | Some(RoofShape::Skillion) => vec![bearing],
+        Some(RoofShape::Hipped) | Some(RoofShape::Pyramidal) => vec![bearing, (bearing + 90.0) % 360.0],
+        _ => vec![bearing, (bearing + 90.0) % 360.0],
+    }
+}
+
+fn footprint_boundary_edges(footprint: &Footprint) -> Vec<([f64; 2], [f64; 2])> {
+    let ext = &footprint.polygon.exterior;
+    let n = ext.len().saturating_sub(1);
+    let mut edges = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = &ext.vertices[i];
+        let b = &ext.vertices[(i + 1) % n];
+        edges.push(([a.x, a.y], [b.x, b.y]));
+    }
+    for hole in &footprint.polygon.interiors {
+        let hn = hole.len().saturating_sub(1);
+        for i in 0..hn {
+            let a = &hole.vertices[i];
+            let b = &hole.vertices[(i + 1) % hn];
+            edges.push(([a.x, a.y], [b.x, b.y]));
+        }
+    }
+    edges
 }
 
 fn main() -> anyhow::Result<()> {

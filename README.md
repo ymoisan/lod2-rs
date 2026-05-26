@@ -100,6 +100,21 @@ graph-cut     --pointcloud INPUT.laz --footprints INPUT.gpkg --output OUTPUT_DIR
 
 Output is a CityJSONL file at `OUTPUT_DIR/output.city.jsonl` ready for downstream tiling with [tyler](https://github.com/3DBAG/tyler).
 
+### Input Requirements
+
+#### Point Cloud Classification
+
+buildex (hybrid) relies on LAS/LAZ point classification (ASPRS standard):
+
+- **Class 6 (Building)**: Used for RANSAC plane detection and roof reconstruction
+- **Class 2 (Ground)**: Used for ground height (h\_ground) estimation via median Z
+- All other classes (vegetation, unclassified, etc.) are **ignored**
+
+buildex trusts the input classification without correction. Misclassified points
+(e.g. vegetation labelled as building) will produce incorrect roof geometry.
+Ensure your point cloud is properly classified before running buildex.
+**Garbage in, garbage out.**
+
 ---
 
 ## Benchmark results (IGN dataset)

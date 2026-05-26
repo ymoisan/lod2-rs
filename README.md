@@ -11,10 +11,16 @@ For background see [A new benchmark on LoD 2 building reconstruction from aerial
 ```
 lod2-rs/
 ├── lod2-common/       # shared I/O, geometry and pipeline crate
-├── plane-extrude/     # TerraScan-style method
-├── arrangement/       # City3D-style method
-└── graph-cut/         # Roofer-style method
+├── hybrid/            # source of the `buildex` binary (primary target)
+├── plane-extrude/     # TerraScan-style method (reference / ablation)
+├── arrangement/       # City3D-style method (reference / ablation)
+└── graph-cut/         # Roofer-style method (reference / ablation)
 ```
+
+The **`buildex`** binary (built from the `hybrid/` crate) is the primary,
+actively-developed reconstructor. The three sibling crates are kept as
+reference baselines.
+
 
 ### lod2-common
 
@@ -77,7 +83,21 @@ Key crates (see `Cargo.toml` for pinned versions):
 
 ## Building
 
-The `gdal` crate requires GDAL development headers.  Inside the `roofer` Nix dev-shell:
+### `buildex` — fully-static musl binary (recommended)
+
+The primary target. Produces `./buildex`, a single-file ELF with no runtime
+dependencies (no GDAL, no shared libraries). Requires only Docker.
+
+```bash
+docker build --output type=local,dest=. -f hybrid-static.dockerfile .
+```
+
+See [README-build.md](README-build.md) for prerequisites, corporate proxy /
+custom CA setup, verification, and cross-platform notes.
+
+### Reference baselines (`plane-extrude`, `arrangement`, `graph-cut`)
+
+These require GDAL development headers. Inside the `roofer` Nix dev-shell:
 
 ```bash
 cd /path/to/lod2-rs
@@ -90,7 +110,34 @@ Binaries are placed in `target/release/`.
 
 ## Running
 
-Each binary accepts the same three arguments:
+### `buildex`
+
+```bash
+./buildex --footprints INPUT.gpkg --pointcloud INPUT.laz --output OUTPUT_DIR
+```
+
+Optional: `--fids 3579,10201,…` to restrict reconstruction to specific
+footprint IDs (useful for debugging individual buildings).
+
+Output is a CityJSONL file at `OUTPUT_DIR/output.city.jsonl` ready for
+downstream tiling with [tyler](https://github.com/3DBAG/tyler).
+
+#### Point cloud classification
+
+`buildex` relies on LAS/LAZ point classification (ASPRS standard):
+
+- **Class 6 (Building)** — RANSAC plane detection and roof reconstruction
+- **Class 2 (Ground)** — ground height (`h_ground`) estimation via median Z
+- All other classes (vegetation, unclassified, etc.) are **ignored**
+
+`buildex` trusts the input classification without correction. Misclassified
+points (e.g. vegetation labelled as building) will produce incorrect roof
+geometry. Ensure your point cloud is properly classified before running
+`buildex`. **Garbage in, garbage out.**
+
+### Reference baselines
+
+Each takes the same three arguments:
 
 ```bash
 plane-extrude --pointcloud INPUT.laz --footprints INPUT.gpkg --output OUTPUT_DIR
@@ -98,22 +145,6 @@ arrangement   --pointcloud INPUT.laz --footprints INPUT.gpkg --output OUTPUT_DIR
 graph-cut     --pointcloud INPUT.laz --footprints INPUT.gpkg --output OUTPUT_DIR
 ```
 
-Output is a CityJSONL file at `OUTPUT_DIR/output.city.jsonl` ready for downstream tiling with [tyler](https://github.com/3DBAG/tyler).
-
-### Input Requirements
-
-#### Point Cloud Classification
-
-buildex (hybrid) relies on LAS/LAZ point classification (ASPRS standard):
-
-- **Class 6 (Building)**: Used for RANSAC plane detection and roof reconstruction
-- **Class 2 (Ground)**: Used for ground height (h\_ground) estimation via median Z
-- All other classes (vegetation, unclassified, etc.) are **ignored**
-
-buildex trusts the input classification without correction. Misclassified points
-(e.g. vegetation labelled as building) will produce incorrect roof geometry.
-Ensure your point cloud is properly classified before running buildex.
-**Garbage in, garbage out.**
 
 ---
 

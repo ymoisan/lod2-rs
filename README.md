@@ -4,6 +4,12 @@ This repo hosts [LoD2](https://osmbuildings.org/blog/2018-02-28_level_of_detail/
 
 For background see [A new benchmark on LoD 2 building reconstruction from aerial lidar and footprints](https://isprs-archives.copernicus.org/articles/XLVIII-1-W6-2025/83/2025/isprs-archives-XLVIII-1-W6-2025-83-2025.pdf).
 
+## Use of AI
+
+Development uses AI coding assistants (GitHub Copilot, Claude). All AI-generated changes are reviewed, tested, and benchmarked by a human author before being committed; no AI tool has direct push access to this repository. The project follows the Government of Canada [Guide on the Use of Generative AI](https://www.canada.ca/en/government/system/digital-government/digital-government-innovations/responsible-use-ai/guide-use-generative-ai.html) and [Guide for Publishing Open Source Code](https://www.canada.ca/en/government/system/digital-government/digital-government-innovations/open-source-software/guide-for-publishing-open-source-code.html). Only public or synthetic data (open lidar tiles, the published ISPRS benchmark, NRCan MRDEM) is shared with AI services; no personal, protected, or sensitive Government of Canada information is provided as prompt context.
+
+## Licence
+
 Released under the [MIT License](LICENSE). Copyright (c) His Majesty the King in Right of Canada, as represented by the Minister of Natural Resources, 2026.
 
 ---
